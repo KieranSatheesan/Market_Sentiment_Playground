@@ -1,0 +1,12 @@
+ticker,exchange,company,aliases
+AAPL,NASDAQ,Apple,apple; apple inc
+TSLA,NASDAQ,Tesla,tesla
+NVDA,NASDAQ,NVIDIA,nvidia
+MSFT,NASDAQ,Microsoft,microsoft
+AMZN,NASDAQ,Amazon,amazon
+GOOGL,NASDAQ,Alphabet,alphabet; google
+META,NASDAQ,Meta Platforms,meta; facebook
+AMD,NASDAQ,Advanced Micro Devices,amd; advanced micro devices
+AMSC,NASDAQ,American Superconductor,american superconductor; amsc
+VOD.L,LSE,Vodafone,vodafone; vod
+ORSTED.CO,CPH,Ørsted,orsted; oersted; Ørsted
