@@ -1,11 +1,41 @@
-# Ignore virtual environment
+# venv
 .venv/
+env/
+venv/
 
-# Ignore Python cache
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+
+# Python cache
 __pycache__/
+*.py[cod]
+*.pyo
 
-# Ignore environment files
+# Notebooks
+.ipynb_checkpoints/
+
+# Secrets
 .env
+*.env
 
-# Ignore local data
+# Data (raw + processed)
 data/
+ref/
+
+# Large artifacts
+*.parquet
+*.zst
+*.log
+*.csv
+*.feather
+*.arrow
+
+# Torrent client leftovers
+*.part
+*.part.*
+*.!qB
+*.torrent

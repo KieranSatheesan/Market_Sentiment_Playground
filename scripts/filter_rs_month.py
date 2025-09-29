@@ -1,0 +1,193 @@
+# scripts/filter_rs_month.py
+import os, io, json, time, argparse, datetime as dt
+from typing import Dict, Any, List
+import zstandard as zstd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+# --- Configurable target subs; keep consistent with YAML if provided ---
+TARGET_SUBS = {s.lower() for s in ["stocks","wallstreetbets","investing","trading","stockmarket"]}
+
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+def date_str_from_utc(ts: float) -> str:
+    return dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+
+# --- Fixed schema to avoid drift ---
+def make_schema() -> pa.schema:
+    return pa.schema([
+        ("id", pa.string()),
+        ("created_utc", pa.int64()),
+        ("subreddit", pa.string()),
+        ("title", pa.string()),
+        ("selftext", pa.string()),
+        ("score", pa.int32()),
+        ("num_comments", pa.int32()),
+        ("author", pa.string()),
+        ("permalink", pa.string()),
+        ("url", pa.string()),
+        ("over_18", pa.bool_()),
+    ])
+
+SCHEMA = make_schema()
+
+def coerce_record(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a Pushshift JSON record into our fixed typed dict."""
+    def s(x):  return "" if x is None else str(x)
+    def i32(x): 
+        try: return int(x)
+        except: return 0
+    def i64(x):
+        try: return int(x)
+        except: return 0
+    def b(x):
+        return bool(x) if isinstance(x, bool) else (str(x).lower() == "true")
+
+    return {
+        "id":         s(rec.get("id")),
+        "created_utc": i64(rec.get("created_utc")),
+        "subreddit":  s(rec.get("subreddit")),
+        "title":      s(rec.get("title")),
+        "selftext":   s(rec.get("selftext")),
+        "score":      i32(rec.get("score")),
+        "num_comments": i32(rec.get("num_comments")),
+        "author":     s(rec.get("author")),
+        "permalink":  s(rec.get("permalink")),
+        "url":        s(rec.get("url")),
+        "over_18":    b(rec.get("over_18")),
+    }
+
+def write_day_part(out_root: str, day: str, rows: List[Dict[str, Any]], part_idx: int) -> int:
+    """Write a list of dict rows to a parquet part for this day, return next part index."""
+    if not rows:
+        return part_idx
+    table = pa.Table.from_pylist(rows, schema=SCHEMA)  # single conversion per flush
+    day_dir = os.path.join(out_root, day)
+    ensure_dir(day_dir)
+    out_file = os.path.join(day_dir, f"submissions_{part_idx:04d}.parquet")
+    pq.write_table(table, out_file, compression="zstd")
+    return part_idx + 1
+
+def process_month(
+    zst_path: str,
+    out_root: str,
+    log_path: str,
+    flush_every: int = 50000,
+    drop_nsfw: bool = False,
+    max_lines: int | None = None,
+    target_subs: set[str] | None = None,
+) -> None:
+    subs = {s.lower() for s in (target_subs or TARGET_SUBS)}
+    ensure_dir(out_root); ensure_dir(os.path.dirname(log_path))
+
+    # per-day buffers and rolling part indices
+    buffers: Dict[str, List[Dict[str, Any]]] = {}
+    part_idx: Dict[str, int] = {}
+
+    count_in = 0
+    kept = 0
+    t0 = time.time()
+
+    with open(zst_path, "rb") as fh, open(log_path, "a", encoding="utf-8") as lg:
+        dctx = zstd.ZstdDecompressor(max_window_size=2**31)
+        with dctx.stream_reader(fh) as reader:
+            text_stream = io.TextIOWrapper(reader, encoding="utf-8")
+            for line in text_stream:
+                if not line:
+                    break
+                count_in += 1
+                if max_lines and count_in > max_lines:
+                    break
+
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                sub = (rec.get("subreddit") or "").lower()
+                if sub not in subs:
+                    continue
+
+                utc = rec.get("created_utc")
+                if utc is None:
+                    continue
+
+                typed = coerce_record(rec)
+                if drop_nsfw and typed["over_18"]:
+                    continue
+
+                day = date_str_from_utc(float(typed["created_utc"]))
+                if day not in buffers:
+                    buffers[day] = []
+                    part_idx.setdefault(day, 0)
+
+                buffers[day].append(typed)
+                kept += 1
+
+                # Flush opportunistically per threshold
+                if kept % flush_every == 0:
+                    for d, rows in list(buffers.items()):
+                        if rows:
+                            part_idx[d] = write_day_part(out_root, d, rows, part_idx[d])
+                            buffers[d].clear()
+                    lg.write(f"{time.strftime('%F %T')} processed={count_in} kept={kept}\n")
+                    lg.flush()
+
+        # Final flush
+        for d, rows in buffers.items():
+            if rows:
+                part_idx[d] = write_day_part(out_root, d, rows, part_idx[d])
+
+        dt_sec = time.time() - t0
+        lg.write(f"DONE {os.path.basename(zst_path)} in {dt_sec:.1f}s lines={count_in} kept={kept}\n")
+        lg.flush()
+
+def load_yaml(path: str) -> dict:
+    if yaml is None:
+        raise RuntimeError("pyyaml is not installed. pip install pyyaml")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", help="Path to YAML config file", default=None)
+    ap.add_argument("--zst", help="Path to RS_YYYY-MM.zst")
+    ap.add_argument("--out", help="Output root folder for daily parquet")
+    ap.add_argument("--log", help="Path to .log file")
+    ap.add_argument("--flush_every", type=int, default=None)
+    ap.add_argument("--drop_nsfw", action="store_true")
+    ap.add_argument("--max_lines", type=int, default=None)
+    ap.add_argument("--subs", nargs="*", help="Override target subreddits list")
+    args = ap.parse_args()
+
+    # Load config then allow CLI overrides
+    cfg = {}
+    if args.config:
+        cfg = load_yaml(args.config) or {}
+
+    zst = args.zst or cfg.get("zst")
+    out = args.out or cfg.get("out")
+    log = args.log or cfg.get("log")
+    flush_every = args.flush_every or cfg.get("flush_every", 50000)
+    drop_nsfw = args.drop_nsfw or bool(cfg.get("drop_nsfw", False))
+    max_lines = args.max_lines or cfg.get("max_lines")
+    subs = set(args.subs) if args.subs else set(cfg.get("subs", [])) or TARGET_SUBS
+
+    if not (zst and out and log):
+        raise SystemExit("Missing required paths: --zst, --out, --log (or set in --config)")
+
+    process_month(
+        zst_path=zst,
+        out_root=out,
+        log_path=log,
+        flush_every=flush_every,
+        drop_nsfw=drop_nsfw,
+        max_lines=max_lines,
+        target_subs=subs,
+    )

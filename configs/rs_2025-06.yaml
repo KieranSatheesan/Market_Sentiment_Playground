@@ -1,0 +1,6 @@
+zst: "C:/Users/Kiera/Amdar/Project - Sentiment-Driven/data/RedditDumps/raw/reddit/submissions/RS_2025-06.zst"
+out: "C:/Users/Kiera/Amdar/Project - Sentiment-Driven/data/RedditDumps/processed"
+log: "C:/Users/Kiera/Amdar/Project - Sentiment-Driven/logs/RS_2025-06.log"
+flush_every: 50000
+drop_nsfw: true
+subs: [stocks, wallstreetbets, investing, trading, stockmarket]
