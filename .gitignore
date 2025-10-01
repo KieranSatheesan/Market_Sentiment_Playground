@@ -29,7 +29,6 @@ ref/
 # Large artifacts
 *.parquet
 *.zst
-*.log
 *.csv
 *.feather
 *.arrow
