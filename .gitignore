@@ -40,3 +40,8 @@ batch/
 *.part.*
 *.!qB
 *.torrent
+
+scripts/build_universe.py
+scripts/clean_ticker_universe_simple.py
+scripts/extract_tickers.py
+scripts/extract_tickers_smart.py
