@@ -27,6 +27,13 @@ __pycache__/
 data/
 ref/
 batch/
+data_v1/
+data_v2/
+logs/
+scripts/clean_reddit_data_v1.py
+scripts/filter_rs_month_v1.py
+tasks/
+
 
 # Large artifacts
 *.parquet
