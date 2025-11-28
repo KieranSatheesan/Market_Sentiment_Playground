@@ -1,94 +1,63 @@
-# scripts/prepare_requests_v4.py
-"""
-Submission-centric request builder (v4).
-
-- Groups by submission_id across a full time range.
-- Each request only contains:
-    - 1 submission item
-    - up to N comment items for that submission (max_comments_per_request).
-- Comments are sorted chronologically (created_utc) before chunking.
-- Supports:
-    (a) date_range mode: all submissions whose created_utc is between [--start, --end]
-    (b) submission_ids mode: only submissions listed in --submission_ids_file
-
-Outputs:
-    batch/Requests_v4/submissions/part-00000.jsonl
-"""
+# scripts/prepare_requests_v4.py (patched core)
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Any, Iterable, List, Optional
-
+from typing import List, Dict, Any, Iterable
 import pandas as pd
 import datetime as dt
 
-SYSTEM_PROMPT_V4 = """
+SYSTEM_PROMPT = """
 You read INPUT ITEMS and return exactly:
 {"results":[ ... ]}
 
-Same order, one output per INPUT ITEM.
+Same order, one output per input.
 
-Each INPUT ITEM looks like one of:
+If kind == "submission":
+- Input:
+  {"kind":"submission","submission_id":"<SID>","text":"..."}
+- Output:
+  {
+    "submission_id": "<SID>",
+    "is_forward": true|false,
+    "value_score": 0.0-1.0,
+    "tickers": [
+      {
+        "symbol": "AAPL",
+        "sentiment_label": "positive"|"neutral"|"negative",
+        "sentiment_score": -1.0..1.0,
+        "conf": 0.0-1.0
+      }
+    ]
+  }
 
-1) Submission item:
-   {
-     "kind": "submission",
-     "submission_id": "<SID>",
-     "text": "..."
-   }
+If kind == "comment":
+- Input:
+  {
+    "kind":"comment",
+    "comment_id":"<CID>",
+    "submission_id":"<SID>",
+    "comment_text":"...",
+    "submission_text":"..."
+  }
+- Use submission_text ONLY to disambiguate tickers.
+- Judge is_forward, value_score, and sentiment based on comment_text itself.
+- Output:
+  {
+    "comment_id": "<CID>",
+    "submission_id": "<SID>",
+    "is_forward": true|false|null,
+    "value_score": 0.0-1.0,
+    "tickers": [ same ticker schema as above ]
+  }
 
-   Output:
-   {
-     "submission_id": "<SID>",
-     "is_forward": true|false,
-     "value_score": 0.0-1.0,
-     "tickers": [
-       {
-         "symbol": "AAPL",
-         "sentiment_label": "positive"|"neutral"|"negative",
-         "sentiment_score": -1.0..1.0,
-         "conf": 0.0-1.0
-       }
-     ]
-   }
-
-2) Comment item:
-   {
-     "kind": "comment",
-     "comment_id": "<CID>",
-     "submission_id": "<SID or null>",
-     "comment_text": "...",
-     "submission_text": "..."   # context only
-   }
-
-   Use submission_text ONLY to disambiguate tickers or context.
-   Judge is_forward, value_score, and sentiment based on comment_text itself.
-
-   Output:
-   {
-     "comment_id": "<CID>",
-     "submission_id": "<SID or null>",
-     "is_forward": true|false|null,
-     "value_score": 0.0-1.0,
-     "tickers": [ same ticker schema as above ]
-   }
-
-Rules (minimal):
-- Equities only; obvious stock tickers (A–Z, 1–6 chars) plus common suffixes (BRK.B, RY.TO, etc). Max 5 unique.
-- Do not invent tickers. Only when clearly about the stock.
-- sentiment_score:
-    > +0.15 → positive
-    < -0.15 → negative
-    else    → neutral
-- is_forward: future-looking price/targets/plays → true; purely backward/none → false; unclear for comments → null allowed.
-- value_score:
-    0.00–0.20 memes/low info
-    0.21–0.50 vague opinions
-    0.51–0.80 some reasoning or partial thesis
-    0.81–1.00 detailed, specific, falsifiable thesis
-- If there are no tickers for an item: "tickers": [] but still set is_forward/value_score.
-Return JSON only with {"results":[...]} and nothing else.
+Rules:
+- Equities only (obvious stock tickers). Max 5 unique.
+- sentiment_score: >+0.15 positive, <-0.15 negative, else neutral.
+- is_forward: future-looking price/targets/plays → true; purely backward → false.
+- value_score: 0.00–0.20 memes, 0.21–0.50 vague, 0.51–0.80 some reasoning, 0.81–1.00 detailed thesis.
+- If no tickers: "tickers": [] but still set is_forward/value_score.
+No extra keys, no explanations.
 """.strip()
 
 
@@ -96,104 +65,112 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def parse_date(s: str) -> dt.date:
-    return dt.date.fromisoformat(s)
-
-
-def iter_rs_parquets(clean_root: Path) -> Iterable[Path]:
+def load_all_submissions(clean_root: Path) -> pd.DataFrame:
+    """
+    Load *all* submissions across RS_* dirs.
+    Returns columns: id (str), title, selftext, text, created_utc, subreddit.
+    """
+    rows = []
     for rs_dir in sorted(clean_root.glob("RS_*")):
         for day_dir in sorted(rs_dir.glob("day=*")):
             p = day_dir / "submissions_clean.parquet"
-            if p.exists():
-                yield p
+            if not p.exists():
+                continue
+
+            # --- FIXED: no nrows=0, use a cheap schema read instead ---
+            schema_df = pd.read_parquet(p).head(0)
+            wanted_cols = ["id", "title", "selftext", "created_utc", "subreddit"]
+            cols = [c for c in wanted_cols if c in schema_df.columns]
+
+            df = pd.read_parquet(p, columns=cols or None)
+            # -----------------------------------------------------------
+
+            if "id" not in df.columns:
+                continue
+            df["id"] = df["id"].astype(str)
+
+            title = df.get("title", "").astype(str)
+            body  = df.get("selftext", "").astype(str)
+            df["text"] = (title.str.strip() + "\n\n" + body.str.strip()).str.strip()
+            rows.append(df)
+
+    if not rows:
+        print("[v4] WARNING: no submissions found under", clean_root)
+        return pd.DataFrame(columns=["id","title","selftext","text","created_utc","subreddit"])
+
+    out = pd.concat(rows, ignore_index=True)
+    if "created_utc" in out.columns:
+        out["created_dt"] = pd.to_datetime(out["created_utc"], unit="s", utc=True)
+        out["date"] = out["created_dt"].dt.date
+    else:
+        out["created_dt"] = pd.NaT
+        out["date"] = pd.NaT
+
+    print(f"[v4] Loaded {len(out):,} submissions total")
+    return out
 
 
-def iter_rc_parquets(clean_root: Path) -> Iterable[Path]:
+def load_all_comments_for_submissions(
+    clean_root: Path,
+    submission_ids: List[str],
+) -> pd.DataFrame:
+    """
+    Load ALL comments whose link_id refers to any of the given submission_ids.
+    Looks across all RC_* dirs and all days.
+    """
+    target_link_ids = {f"t3_{sid}" for sid in submission_ids}
+    rows = []
+
     for rc_dir in sorted(clean_root.glob("RC_*")):
         for day_dir in sorted(rc_dir.glob("day=*")):
             p = day_dir / "comments_clean.parquet"
-            if p.exists():
-                yield p
+            if not p.exists():
+                continue
+
+            # --- FIXED: no nrows=0, use schema read ---
+            schema_df = pd.read_parquet(p).head(0)
+            wanted_cols = [
+                "id", "body", "link_id", "created_utc",
+                "subreddit", "score", "parent_id", "permalink", "author"
+            ]
+            cols = [c for c in wanted_cols if c in schema_df.columns]
+
+            df = pd.read_parquet(p, columns=cols or None)
+            # -------------------------------------------
+
+            if df.empty:
+                continue
+            df["id"] = df["id"].astype(str)
+            if "link_id" in df.columns:
+                df["link_id"] = df["link_id"].astype(str)
+            else:
+                continue
+
+            mask = df["link_id"].isin(target_link_ids)
+            if not mask.any():
+                continue
+
+            df = df[mask].copy()
+            df["comment_text"] = df.get("body", "").astype(str)
+            rows.append(df)
+
+    if not rows:
+        print("[v4] WARNING: no comments found for selected submissions.")
+        return pd.DataFrame(columns=[
+            "id","link_id","comment_text","created_utc",
+            "subreddit","score","parent_id","permalink","author"
+        ])
+
+    out = pd.concat(rows, ignore_index=True)
+    if "created_utc" in out.columns:
+        out["created_dt"] = pd.to_datetime(out["created_utc"], unit="s", utc=True)
+    print(f"[v4] Loaded {len(out):,} comments for {len(submission_ids)} submissions")
+    return out
 
 
-def load_all_submissions(clean_root: Path) -> pd.DataFrame:
-    parts = []
-    for p in iter_rs_parquets(clean_root):
-        df = pd.read_parquet(p)
-        df["id"] = df["id"].astype(str)
-        # build text if missing
-        if "text" not in df.columns:
-            title = df.get("title", "").astype(str)
-            body = df.get("selftext", "").astype(str)
-            df["text"] = (title.str.strip() + "\n\n" + body.str.strip()).str.strip()
-        parts.append(df)
-    if not parts:
-        return pd.DataFrame()
-    df_all = pd.concat(parts, ignore_index=True)
-    return df_all
-
-
-def load_all_comments(clean_root: Path) -> pd.DataFrame:
-    parts = []
-    for p in iter_rc_parquets(clean_root):
-        df = pd.read_parquet(p)
-        df["id"] = df["id"].astype(str)
-        if "text" not in df.columns:
-            df["text"] = df.get("body", "").astype(str)
-        parts.append(df)
-    if not parts:
-        return pd.DataFrame()
-    df_all = pd.concat(parts, ignore_index=True)
-    return df_all
-
-
-def add_created_date_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "created_utc" in df.columns:
-        df["created_dt"] = pd.to_datetime(df["created_utc"], unit="s", utc=True)
-        df["date"] = df["created_dt"].dt.date
-    else:
-        df["created_dt"] = pd.NaT
-        df["date"] = pd.NaT
-    return df
-
-
-def derive_submission_id_from_link_id(link_id: Any) -> Optional[str]:
-    if link_id is None or (isinstance(link_id, float) and pd.isna(link_id)):
-        return None
-    s = str(link_id)
-    return s[3:] if s.startswith("t3_") else s
-
-
-def chunk_list(lst: List[Any], n: int) -> Iterable[List[Any]]:
+def chunk(lst, n) -> Iterable[list]:
     for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-
-def build_request_body(
-    model: str,
-    max_output_tokens: int,
-    items: List[Dict[str, Any]],
-    text_format: str,
-) -> Dict[str, Any]:
-    user_content = (
-        'Return JSON only: {"results":[...]} with one output per INPUT ITEM, same order.\n'
-        "BEGIN_INPUTS:\n"
-        + "\n".join(json.dumps(obj, ensure_ascii=False) for obj in items)
-    )
-
-    body: Dict[str, Any] = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT_V4},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": 0,
-        "max_output_tokens": max_output_tokens,
-    }
-    if text_format != "none":
-        body["text"] = {"format": {"type": text_format}}
-    return body
+        yield lst[i:i+n]
 
 
 def main():
@@ -201,214 +178,142 @@ def main():
     ap.add_argument("--clean_root", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--model", default="gpt-4.1-mini")
-    ap.add_argument(
-        "--mode",
-        choices=["date_range", "submission_ids"],
-        default="date_range",
-        help="How to choose which submissions to process.",
-    )
-    ap.add_argument(
-        "--submission_ids_file",
-        help="If mode=submission_ids, path to a text file with one submission_id per line.",
-    )
-    ap.add_argument("--start", help="Submission date start (YYYY-MM-DD) for date_range mode")
-    ap.add_argument("--end", help="Submission date end (YYYY-MM-DD) for date_range mode")
-    ap.add_argument(
-        "--comment_start",
-        help="Comment date start (YYYY-MM-DD). Defaults to --start if omitted.",
-    )
-    ap.add_argument(
-        "--comment_end",
-        help="Comment date end (YYYY-MM-DD). Defaults to --end if omitted.",
-    )
-    ap.add_argument("--max_comments_per_request", type=int, default=15)
-    ap.add_argument("--max_requests_per_file", type=int, default=800)
-    ap.add_argument("--text_format", choices=["none", "json_object", "text", "json_schema"],
+    ap.add_argument("--seed_ids_file", help="Text file; one submission id (e.g. 1lgdft5) per line")
+    ap.add_argument("--start", help="optional YYYY-MM-DD lower bound on submission date")
+    ap.add_argument("--end", help="optional YYYY-MM-DD upper bound on submission date")
+    ap.add_argument("--max_comments_per_req", type=int, default=15)
+    ap.add_argument("--max_chars", type=int, default=1500)
+    ap.add_argument("--max_output_tokens", type=int, default=800)
+    ap.add_argument("--text_format", choices=["none","json_object","text","json_schema"],
                     default="json_object")
-    ap.add_argument("--max_output_tokens", type=int, default=1200)
     args = ap.parse_args()
 
     clean_root = Path(args.clean_root)
-    out_root = Path(args.out_dir)
+    out_root   = Path(args.out_dir)
     ensure_dir(out_root)
+    req_dir = out_root / "submissions"
+    ensure_dir(req_dir)
 
-    # -------- Load full RS/RC universe once --------
-    print("[v4] Loading all submissions...")
-    df_sub_all = load_all_submissions(clean_root)
-    df_sub_all = add_created_date_cols(df_sub_all)
+    # 1) Load all submissions
+    df_subs = load_all_submissions(clean_root)
+    if df_subs.empty:
+        print("[v4] No submissions loaded; exiting.")
+        return
 
-    print("[v4] Loading all comments...")
-    df_cmt_all = load_all_comments(clean_root)
-    df_cmt_all = add_created_date_cols(df_cmt_all)
+    # 2) Optional date filter
+    if args.start:
+        start_date = dt.date.fromisoformat(args.start)
+        df_subs = df_subs[df_subs["date"] >= start_date]
+    if args.end:
+        end_date = dt.date.fromisoformat(args.end)
+        df_subs = df_subs[df_subs["date"] <= end_date]
 
-    # Derive submission_id for comments
-    df_cmt_all["submission_id"] = df_cmt_all["link_id"].apply(
-        derive_submission_id_from_link_id
-    )
+    print(f"[v4] After date filter: {len(df_subs):,} submissions remain")
 
-    # -------- Filter submissions we will process --------
-    if args.mode == "date_range":
-        if not args.start or not args.end:
-            raise SystemExit("--start and --end are required in date_range mode")
-        start_date = parse_date(args.start)
-        end_date = parse_date(args.end)
-        mask = (df_sub_all["date"] >= start_date) & (df_sub_all["date"] <= end_date)
-        df_sub = df_sub_all[mask].copy()
-        print(f"[v4] Submissions in [{start_date}..{end_date}]: {len(df_sub)}")
+    # 3) Seed filter (handle BOM / weird whitespace robustly)
+    if args.seed_ids_file:
+        seed_path = Path(args.seed_ids_file)
 
-        comment_start = parse_date(args.comment_start) if args.comment_start else start_date
-        comment_end = parse_date(args.comment_end) if args.comment_end else end_date
-    else:
-        # submission_ids mode
-        if not args.submission_ids_file:
-            raise SystemExit("--submission_ids_file is required in submission_ids mode")
-        sids = []
-        with open(args.submission_ids_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                sid = line.strip()
-                if sid:
-                    sids.append(sid)
-        sids = sorted(set(sids))
-        df_sub = df_sub_all[df_sub_all["id"].isin(sids)].copy()
-        print(f"[v4] Found {len(df_sub)} submissions matching {len(sids)} IDs")
+        # Read with utf-8-sig to transparently strip BOM if present
+        raw_lines = seed_path.read_text(encoding="utf-8-sig").splitlines()
 
-        # For smoke tests, you can set comment_start/comment_end wide
-        if args.comment_start and args.comment_end:
-            comment_start = parse_date(args.comment_start)
-            comment_end = parse_date(args.comment_end)
-        else:
-            # fallback: min/max over all comments
-            comment_start = df_cmt_all["date"].min()
-            comment_end = df_cmt_all["date"].max()
+        seeds: list[str] = []
+        for ln in raw_lines:
+            s = ln.strip()
+            # extra safety: strip a leading BOM if it survived for any reason
+            if s.startswith("\ufeff"):
+                s = s.lstrip("\ufeff")
+            if s:
+                seeds.append(s)
 
-    # Filter comments to a window, but they can still refer to earlier submissions
-    mask_c = (df_cmt_all["date"] >= comment_start) & (df_cmt_all["date"] <= comment_end)
-    df_cmt = df_cmt_all[mask_c].copy()
-    print(f"[v4] Comments in [{comment_start}..{comment_end}]: {len(df_cmt)}")
+        # dedupe while preserving order
+        seeds = list(dict.fromkeys(seeds))
 
-    # Build submission text map (id -> text)
-    sub_text_map: Dict[str, str] = {}
-    for _, r in df_sub_all.iterrows():
-        sid = str(r["id"])
-        sub_text_map[sid] = str(r["text"])
+        print(f"[v4] Seed IDs ({len(seeds)}): {seeds}")
 
-    # Group comments by submission_id within the filtered comment set
-    grouped_comments = df_cmt.groupby("submission_id")
+        df_subs = df_subs[df_subs["id"].astype(str).isin(seeds)].copy()
+        print(f"[v4] Found {len(df_subs):,} submissions matching seed IDs")
 
-    # Output: single dir "submissions"
-    out_sub_dir = out_root / "submissions"
-    ensure_dir(out_sub_dir)
+        if df_subs.empty:
+            print("[v4] Nothing matches the provided seed IDs – aborting.")
+            return
 
-    part_idx = 0
-    written_in_part = 0
-    total_requests = 0
+    # 4) Load all comments for these submissions (across *all* days)
+    sub_ids = df_subs["id"].tolist()
+    df_comments = load_all_comments_for_submissions(clean_root, sub_ids)
 
-    def open_part(idx: int):
-        p = out_sub_dir / f"part-{idx:05d}.jsonl"
-        f = p.open("w", encoding="utf-8")
-        return f, p
+    # 5) Build and write requests grouped per submission
+    part_path = req_dir / "part-00000.jsonl"
+    written = 0
 
-    f, part_path = open_part(part_idx)
-
-    # -------- Build requests per submission --------
-    for _, sub_row in df_sub.sort_values("created_dt").iterrows():
-        sid = str(sub_row["id"])
-        sub_text = sub_text_map.get(sid, "")
-        if not sub_text:
-            continue
-
-        # All comments (within the comment date window) that link to this submission
-        try:
-            sub_comments = grouped_comments.get_group(sid).copy()
-        except KeyError:
-            sub_comments = pd.DataFrame()
-
-        # Sort by created_dt if available
-        if "created_dt" in sub_comments.columns:
-            sub_comments = sub_comments.sort_values("created_dt")
-
-        # Build comment items list
-        comment_items: List[Dict[str, Any]] = []
-        for _, c in sub_comments.iterrows():
-            ctext = str(c["text"]).strip()
-            if not ctext:
+    with part_path.open("w", encoding="utf-8") as f:
+        for _, sub in df_subs.iterrows():
+            sid = sub["id"]
+            stext = str(sub["text"])[:args.max_chars].strip()
+            if not stext:
                 continue
-            comment_items.append(
-                {
-                    "kind": "comment",
-                    "comment_id": str(c["id"]),
+
+            cmt_for_sub = (
+                df_comments[df_comments["link_id"] == f"t3_{sid}"]
+                if not df_comments.empty else pd.DataFrame()
+            )
+
+            if cmt_for_sub.empty:
+                # Still send one request with just the submission (so it gets annotated)
+                groups = [[]]
+            else:
+                comments = [
+                    {
+                        "kind": "comment",
+                        "comment_id": r["id"],
+                        "submission_id": sid,
+                        "comment_text": str(r["comment_text"])[:args.max_chars].strip(),
+                        "created_utc": int(r.get("created_utc", 0)),
+                    }
+                    for _, r in cmt_for_sub.sort_values("created_utc").iterrows()
+                ]
+                groups = list(chunk(comments, args.max_comments_per_req))
+
+            for gi, comment_chunk in enumerate(groups):
+                items: List[Dict[str, Any]] = []
+                items.append({
+                    "kind": "submission",
                     "submission_id": sid,
-                    "comment_text": ctext,
-                    "submission_text": sub_text,
+                    "text": stext,
+                })
+                items.extend(comment_chunk)
+
+                user_content = (
+                    'Return JSON only: {"results":[...]} with one output per INPUT ITEM, same order.\n'
+                    "BEGIN_INPUTS:\n" +
+                    "\n".join(json.dumps(obj, ensure_ascii=False) for obj in items)
+                )
+
+                body: Dict[str, Any] = {
+                    "model": args.model,
+                    "input": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "temperature": 0,
+                    "max_output_tokens": args.max_output_tokens,
                 }
-            )
+                if args.text_format != "none":
+                    body["text"] = {"format": {"type": args.text_format}}
 
-        # Always include the submission itself as an item
-        submission_item = {
-            "kind": "submission",
-            "submission_id": sid,
-            "text": str(sub_text).strip(),
-        }
+                custom_id = f"sub:{sid}:{gi:04d}"
+                line = {
+                    "custom_id": custom_id,
+                    "method": "POST",
+                    "url": "/v1/responses",
+                    "body": body,
+                }
+                f.write(json.dumps(line, ensure_ascii=False) + "\n")
+                written += 1
 
-        if not comment_items:
-            # We can still send the submission by itself
-            items_batch = [submission_item]
-            body = build_request_body(
-                args.model,
-                args.max_output_tokens,
-                items_batch,
-                args.text_format,
-            )
-            custom_id = f"sub:{sid}:0000:subonly"
-            line = {
-                "custom_id": custom_id,
-                "method": "POST",
-                "url": "/v1/responses",
-                "body": body,
-            }
-
-            if written_in_part >= args.max_requests_per_file:
-                f.close()
-                part_idx += 1
-                written_in_part = 0
-                f, part_path = open_part(part_idx)
-
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
-            written_in_part += 1
-            total_requests += 1
-            continue
-
-        # Chunk comments for this submission
-        for chunk_idx, chunk_comments in enumerate(
-            chunk_list(comment_items, args.max_comments_per_request)
-        ):
-            items_batch = [submission_item] + chunk_comments
-            body = build_request_body(
-                args.model,
-                args.max_output_tokens,
-                items_batch,
-                args.text_format,
-            )
-            custom_id = f"sub:{sid}:{chunk_idx:04d}"
-
-            if written_in_part >= args.max_requests_per_file:
-                f.close()
-                part_idx += 1
-                written_in_part = 0
-                f, part_path = open_part(part_idx)
-
-            line = {
-                "custom_id": custom_id,
-                "method": "POST",
-                "url": "/v1/responses",
-                "body": body,
-            }
-            f.write(json.dumps(line, ensure_ascii=False) + "\n")
-            written_in_part += 1
-            total_requests += 1
-
-    f.close()
-    print(f"[v4] Wrote {total_requests} requests into {part_idx+1} part file(s) under {out_sub_dir}")
+    print(f"[v4] Wrote {written} requests into {part_path}")
+    if written == 0:
+        print("[v4] WARNING: no requests actually written – check filters / seeds.")
 
 
 if __name__ == "__main__":
