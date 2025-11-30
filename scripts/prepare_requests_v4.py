@@ -8,56 +8,48 @@ import pandas as pd
 import datetime as dt
 
 SYSTEM_PROMPT = """
-You read INPUT ITEMS and return exactly:
+You read INPUT ITEMS and must reply with **only**:
+
 {"results":[ ... ]}
 
-Same order, one output per input.
+One result per INPUT ITEM, same order.
 
-If kind == "submission":
-- Input:
-  {"kind":"submission","submission_id":"<SID>","text":"..."}
-- Output:
-  {
-    "submission_id": "<SID>",
-    "is_forward": true|false,
-    "value_score": 0.0-1.0,
-    "tickers": [
-      {
-        "symbol": "AAPL",
-        "sentiment_label": "positive"|"neutral"|"negative",
-        "sentiment_score": -1.0..1.0,
-        "conf": 0.0-1.0
-      }
-    ]
-  }
+Each INPUT ITEM is JSON:
+- Submission: {"kind":"submission","submission_id":"<SID>","text":"..."}
+- Comment:    {"kind":"comment","comment_id":"<CID>","submission_id":"<SID>","comment_text":"...","submission_text":"..."}
 
-If kind == "comment":
-- Input:
-  {
-    "kind":"comment",
-    "comment_id":"<CID>",
-    "submission_id":"<SID>",
-    "comment_text":"...",
-    "submission_text":"..."
-  }
-- Use submission_text ONLY to disambiguate tickers.
-- Judge is_forward, value_score, and sentiment based on comment_text itself.
-- Output:
-  {
-    "comment_id": "<CID>",
-    "submission_id": "<SID>",
-    "is_forward": true|false|null,
-    "value_score": 0.0-1.0,
-    "tickers": [ same ticker schema as above ]
-  }
+For each submission output:
+{"submission_id":"<SID>","is_forward":true|false,"value_score":0.0-1.0,"tickers":[...]}
+For each comment output:
+{"comment_id":"<CID>","submission_id":"<SID>","is_forward":true|false|null,"value_score":0.0-1.0,"tickers":[...]}
 
-Rules:
-- Equities only (obvious stock tickers). Max 5 unique.
-- sentiment_score: >+0.15 positive, <-0.15 negative, else neutral.
-- is_forward: future-looking price/targets/plays → true; purely backward → false.
-- value_score: 0.00–0.20 memes, 0.21–0.50 vague, 0.51–0.80 some reasoning, 0.81–1.00 detailed thesis.
-- If no tickers: "tickers": [] but still set is_forward/value_score.
-No extra keys, no explanations.
+Tickers:
+- Only real traded stocks/ETFs/REITs; symbols 1–6 A–Z, optional suffix (".TO",".L", etc.).
+- Max 5 per item; do NOT use generic words (gold, oil, market, crypto, etc.) as symbols.
+- Each ticker:
+  {"symbol":"AAPL","sentiment_label":"positive|neutral|negative","sentiment_score":-1.0..1.0,"conf":0.0-1.0}
+- sentiment_label must match sentiment_score:
+    > +0.15 → positive
+    < -0.15 → negative
+    else    → neutral.
+
+is_forward:
+- true  = clear future-looking view or trading action
+          (prediction, target, “will buy/sell”, “this will pump/dump”).
+- false = past events, current status, questions, or no clear forward view.
+- null  = only for comments where intent cannot be inferred.
+
+value_score (trading info value of this text alone):
+- 0.0      : no trading value / pure meme.
+- 0.1–0.3  : very low (vague, emotional, noisy).
+- 0.4–0.6  : relevant but shallow or unspecific.
+- 0.7–0.8  : somewhat useful (non-trivial reasoning).
+- 0.9–1.0  : very informative (specific catalysts, numbers, falsifiable thesis).
+
+Use "text" for submissions, "comment_text" for comments; use "submission_text" only as context.
+If no tickers, set "tickers":[] but still set is_forward and value_score.
+
+No extra fields. No natural-language explanation.
 """.strip()
 
 
