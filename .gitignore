@@ -55,3 +55,5 @@ scripts/extract_tickers_smart.py
 scripts/prepare_requests_v2_gpt4nano.py
 scripts/prepare_requests_v2_gpt5nano.py
 data_v4/
+batch_v4_test/
+data_v4_test/

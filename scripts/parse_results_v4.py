@@ -216,14 +216,16 @@ def main():
 
         for it in parse_payload_text(txt):
             if kind == "rs":
+                # Submissions: key by submission_id
                 did = str(it.get("submission_id") or it.get("id") or "").strip()
             else:
-                did = str(
-                    it.get("comment_id")
-                    or it.get("submission_id")
-                    or it.get("id")
-                    or ""
-                ).strip()
+                # Comments (v4): batches include one submission + many comments.
+                # We only want *comment* rows here, so require comment_id.
+                cid = it.get("comment_id")
+                if not cid:
+                    # Skip submission rows or any malformed entries
+                    continue
+                did = str(cid).strip()
             if not did:
                 continue
 
