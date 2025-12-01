@@ -1,4 +1,4 @@
-# scripts/prepare_requests_v4.py (patched core)
+# scripts/prepare_requests_v4.py (v4 submission+comments context)
 
 import argparse
 import json
@@ -8,49 +8,56 @@ import pandas as pd
 import datetime as dt
 
 SYSTEM_PROMPT = """
-You read INPUT ITEMS and must reply with **only**:
-
+You read INPUT ITEMS and must reply with ONLY:
 {"results":[ ... ]}
-
 One result per INPUT ITEM, same order.
 
 Each INPUT ITEM is JSON:
 - Submission: {"kind":"submission","submission_id":"<SID>","text":"..."}
-- Comment:    {"kind":"comment","comment_id":"<CID>","submission_id":"<SID>","comment_text":"...","submission_text":"..."}
+- Comment:    {"kind":"comment","comment_id":"<CID>","submission_id":"<SID>","comment_text":"..."}
+
+INPUT ITEMS always start with the submission; the rest are its comments.
 
 For each submission output:
-{"submission_id":"<SID>","is_forward":true|false,"value_score":0.0-1.0,"tickers":[...]}
+{"submission_id":"<SID>","is_forward":true|false|null,"value_score":0.0-1.0,"tickers":[...]}
+
 For each comment output:
 {"comment_id":"<CID>","submission_id":"<SID>","is_forward":true|false|null,"value_score":0.0-1.0,"tickers":[...]}
 
 Tickers:
-- Only real traded stocks/ETFs/REITs; symbols 1–6 A–Z, optional suffix (".TO",".L", etc.).
-- Max 5 per item; do NOT use generic words (gold, oil, market, crypto, etc.) as symbols.
+- Only real traded stocks/ETFs/REITs; symbols 1–6 A–Z, optional suffix like ".TO" or ".L".
+- Max 5 per item; NEVER treat generic words (gold, oil, market, crypto, etc.) as symbols.
+- You may infer symbols from clear context (e.g. “the VOO ETF”), but never invent them.
 - Each ticker:
   {"symbol":"AAPL","sentiment_label":"positive|neutral|negative","sentiment_score":-1.0..1.0,"conf":0.0-1.0}
-- sentiment_label must match sentiment_score:
-    > +0.15 → positive
-    < -0.15 → negative
-    else    → neutral.
 
-is_forward:
-- true  = clear future-looking view or trading action
-          (prediction, target, “will buy/sell”, “this will pump/dump”).
-- false = past events, current status, questions, or no clear forward view.
-- null  = only for comments where intent cannot be inferred.
+sentiment_score (for this ticker in this text):
+- -1.0 to -0.8 : very strong negative
+- -0.7 to -0.4 : clearly negative
+- -0.3 to -0.1 : mildly negative
+-  0.0         : neutral / cannot infer
+-  0.1 to 0.3  : mildly positive
+-  0.4 to 0.7  : clearly positive
+-  0.8 to 1.0  : very strong positive
+sentiment_label must match the sign of sentiment_score.
+
+is_forward (future-looking trading relevance of this text):
+- true  = clear forward view or trading action (prediction, target, “will buy/sell”, “will pump/dump”, etc.)
+- false = past events, questions, commentary, or no clear forward view
+- null  = only when intent is genuinely impossible to infer
 
 value_score (trading info value of this text alone):
-- 0.0      : no trading value / pure meme.
-- 0.1–0.3  : very low (vague, emotional, noisy).
-- 0.4–0.6  : relevant but shallow or unspecific.
-- 0.7–0.8  : somewhat useful (non-trivial reasoning).
-- 0.9–1.0  : very informative (specific catalysts, numbers, falsifiable thesis).
+- 0.0      : no trading value / pure meme
+- 0.1–0.3  : very low value (vague, emotional, noisy)
+- 0.4–0.6  : relevant but shallow or vague
+- 0.7–0.8  : moderately useful reasoning
+- 0.9–1.0  : highly actionable, specific, falsifiable thesis
 
-Use "text" for submissions, "comment_text" for comments; use "submission_text" only as context.
-If no tickers, set "tickers":[] but still set is_forward and value_score.
-
-No extra fields. No natural-language explanation.
+Use "text" for submissions and "comment_text" for comments.
+If no tickers: "tickers":[] but still set is_forward and value_score.
+No extra fields. No explanations.
 """.strip()
+
 
 
 def ensure_dir(p: Path) -> None:
@@ -69,14 +76,12 @@ def load_all_submissions(clean_root: Path) -> pd.DataFrame:
             if not p.exists():
                 continue
 
-            # --- FIXED: no nrows=0, use a cheap schema read instead ---
+            # cheap schema read
             schema_df = pd.read_parquet(p).head(0)
             wanted_cols = ["id", "title", "selftext", "created_utc", "subreddit"]
             cols = [c for c in wanted_cols if c in schema_df.columns]
 
             df = pd.read_parquet(p, columns=cols or None)
-            # -----------------------------------------------------------
-
             if "id" not in df.columns:
                 continue
             df["id"] = df["id"].astype(str)
@@ -119,7 +124,7 @@ def load_all_comments_for_submissions(
             if not p.exists():
                 continue
 
-            # --- FIXED: no nrows=0, use schema read ---
+            # cheap schema read
             schema_df = pd.read_parquet(p).head(0)
             wanted_cols = [
                 "id", "body", "link_id", "created_utc",
@@ -128,8 +133,6 @@ def load_all_comments_for_submissions(
             cols = [c for c in wanted_cols if c in schema_df.columns]
 
             df = pd.read_parquet(p, columns=cols or None)
-            # -------------------------------------------
-
             if df.empty:
                 continue
             df["id"] = df["id"].astype(str)
@@ -268,11 +271,13 @@ def main():
 
             for gi, comment_chunk in enumerate(groups):
                 items: List[Dict[str, Any]] = []
+                # First item: submission
                 items.append({
                     "kind": "submission",
                     "submission_id": sid,
                     "text": stext,
                 })
+                # Remaining items: comments
                 items.extend(comment_chunk)
 
                 user_content = (
