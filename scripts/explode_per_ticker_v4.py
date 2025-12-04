@@ -14,6 +14,7 @@ def ensure_list(x):
     except Exception:
         return []
 
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--annotated_parquet", required=True)
@@ -32,7 +33,7 @@ def main():
 
     passthrough = [c for c in [
         "created_utc","subreddit","score","num_comments",
-        "parent_id","link_id","permalink","author"
+        "parent_id","link_id","permalink","author","__day__"
     ] if c in df.columns]
 
     rows = []
@@ -48,6 +49,7 @@ def main():
                 "id": r.get("id"),
                 "kind": r.get("kind"),
                 "symbol": sym,
+                "asset_type": t.get("asset_type"),
                 "sentiment_label": t.get("sentiment_label"),
                 "sentiment_score": t.get("sentiment_score", t.get("score")),
                 "conf": t.get("conf"),
@@ -59,6 +61,7 @@ def main():
     out = pd.DataFrame(rows)
     out.to_parquet(out_path, index=False)
     print(f"[v4] Exploded {len(out):,} rows → {out_path}")
+
 
 if __name__ == "__main__":
     main()
