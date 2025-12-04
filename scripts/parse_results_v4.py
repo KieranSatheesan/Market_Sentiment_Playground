@@ -1,4 +1,5 @@
 # scripts/parse_results_v4.py
+
 """
 Parse v4 submission-centric Batch results into annotated parquet(s).
 
@@ -28,9 +29,6 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import datetime as dt
-
-
-# -------------------- helpers for cleaned data --------------------
 
 
 def parse_date(s: str) -> dt.date:
@@ -79,7 +77,6 @@ def load_clean_range(clean_root: Path, kind: str, start: dt.date, end: dt.date) 
 
     df_all = pd.concat(parts, ignore_index=True)
 
-    # Build text column if missing
     if "text" not in df_all.columns:
         if kind == "rs":
             title = df_all.get("title", "").astype(str)
@@ -91,18 +88,10 @@ def load_clean_range(clean_root: Path, kind: str, start: dt.date, end: dt.date) 
     return df_all
 
 
-# -------------------- helpers for Batch output --------------------
-
-
 def extract_output_text(env: Dict[str, Any]) -> Optional[str]:
-    """
-    Drill into the Batch line to extract the model's text output.
-    Compatible with /v1/responses style payloads.
-    """
     resp = env.get("response") or {}
     body = resp.get("body")
 
-    # Newer responses: body["output"][0]["content"][0]["text"]
     if isinstance(body, dict):
         if body.get("status") and body["status"] != "completed":
             return None
@@ -117,7 +106,6 @@ def extract_output_text(env: Dict[str, Any]) -> Optional[str]:
                     if isinstance(txt, str):
                         return txt
 
-    # Fallbacks
     txt = resp.get("output_text")
     if isinstance(txt, str) and txt.strip():
         return txt
@@ -137,11 +125,6 @@ def extract_output_text(env: Dict[str, Any]) -> Optional[str]:
 
 
 def parse_payload_text(txt: str) -> List[Dict[str, Any]]:
-    """
-    Model is supposed to return:
-      {"results":[ {...}, {...}, ... ]}
-    but we defensively accept a few variants.
-    """
     try:
         obj = json.loads(txt)
     except Exception:
@@ -160,14 +143,6 @@ def parse_payload_text(txt: str) -> List[Dict[str, Any]]:
 
 
 def iter_result_lines(results_root: Path, kind: str):
-    """
-    In v4, Batch results live under:
-        results_root/submissions/part-*.jsonl
-
-    For kind="rs": we read from 'submissions/'.
-    For kind="rc": we ALSO read from 'submissions/' and then filter
-                   down to comment rows (comment_id present).
-    """
     sub_dir = results_root / "submissions"
 
     if not sub_dir.exists():
@@ -194,6 +169,7 @@ def normalize_one_ticker(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     label = d.get("sentiment_label", d.get("label", d.get("sentiment")))
     score = d.get("sentiment_score", d.get("score"))
     conf = d.get("conf", d.get("confidence"))
+    asset_type = d.get("asset_type")
 
     try:
         if score is not None:
@@ -217,15 +193,24 @@ def normalize_one_ticker(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             else:
                 label = "neutral"
 
+    allowed_asset_types = {
+        "equity", "etf", "reit", "index",
+        "commodity", "fx", "crypto", "bond", "other",
+    }
+    if isinstance(asset_type, str):
+        asset_type = asset_type.strip().lower()
+        if asset_type not in allowed_asset_types:
+            asset_type = "other"
+    else:
+        asset_type = None  # can be filled downstream if needed
+
     return {
         "symbol": sym,
+        "asset_type": asset_type,
         "sentiment_label": label,
         "sentiment_score": score,
         "conf": conf,
     }
-
-
-# -------------------- main --------------------
 
 
 def main():
@@ -277,31 +262,22 @@ def main():
         for it in parse_payload_text(txt):
             objects_seen += 1
 
-            # NEW GUARD: skip any non-dict junk rows
             if not isinstance(it, dict):
-                # Optionally log once if you want:
-                # print("[v4] Skipping non-dict result item:", repr(it)[:200])
                 continue
 
-            # --- Decide which ID we key on ---
             if kind == "rs":
-                # For submissions: only keep actual submission rows
                 did = str(it.get("submission_id") or "").strip()
                 if not did:
-                    # Ignore any stray comment-style objects if present
                     continue
             else:
-                # For comments: only keep actual comment rows
                 cid = it.get("comment_id")
                 if not cid:
-                    # Skip the submission-level result in each group
                     continue
                 did = str(cid).strip()
 
             if not did:
                 continue
 
-            # --- Normalise tickers ---
             raw_tickers = it.get("tickers") or []
             norm_tickers: List[Dict[str, Any]] = []
             for t in raw_tickers:
@@ -309,7 +285,6 @@ def main():
                 if nt:
                     norm_tickers.append(nt)
 
-            # --- Normalise is_forward (allow None) ---
             is_forward = it.get("is_forward")
             if isinstance(is_forward, str):
                 low = is_forward.strip().lower()
@@ -322,7 +297,6 @@ def main():
             elif not isinstance(is_forward, bool) and is_forward is not None:
                 is_forward = None
 
-            # --- Normalise value_score ---
             value_score = it.get("value_score")
             try:
                 if value_score is not None:
@@ -336,20 +310,17 @@ def main():
                 "value_score": value_score,
             }
 
-
     print(f"[v4] Parsed {lines_seen} batch lines, {objects_seen} result objects.")
     print(f"[v4] Unique IDs with annotations: {len(parsed_by_id)}")
 
     id_keys = set(parsed_by_id.keys())
 
-    # For comments, only keep rows we actually annotated in this run.
     if kind == "rc":
         before = len(df_clean)
         df_clean = df_clean[df_clean["id"].isin(id_keys)].copy()
         print(f"[v4] Filtered rc clean data from {before} → {len(df_clean)} rows using parsed IDs.")
 
     try:
-        # Build meta-frame keyed by clean 'id'
         meta = pd.DataFrame({"id": df_clean["id"]})
         meta["tmp"] = meta["id"].map(parsed_by_id)
 
@@ -370,12 +341,10 @@ def main():
 
         base_name = "submissions" if kind == "rs" else "comments"
 
-        # 1) Range-wide output (for backwards compatibility)
         out_name = f"{base_name}_annotated_{start.isoformat()}_to_{end.isoformat()}.parquet"
         out_parquet = out_dir / out_name
         annotated.to_parquet(out_parquet, index=False)
 
-        # 2) Day-partitioned outputs
         if "__day__" in annotated.columns:
             kind_dir = "submission_tickers" if kind == "rs" else "comment_tickers"
             root = out_dir / kind_dir
@@ -387,7 +356,6 @@ def main():
                 df_day.to_parquet(day_out, index=False)
                 print(f"[v4] Wrote {len(df_day)} {kind} rows → {day_out}")
 
-        # Missing IDs (mainly for submissions)
         missing = annotated.loc[~annotated["id"].isin(id_keys), "id"].astype(str)
         if not missing.empty:
             failed_path = out_dir / f"{base_name}_failed.jsonl"
