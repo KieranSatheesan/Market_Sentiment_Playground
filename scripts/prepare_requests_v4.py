@@ -97,7 +97,8 @@ def load_all_submissions(clean_root: Path) -> pd.DataFrame:
 
             title = df.get("title", "").astype(str)
             body  = df.get("selftext", "").astype(str)
-            df["text"] = (title.str.strip() + "\n\n" + body.stripped()).str.strip()
+            # ✅ FIX: use body.str.strip(), not body.stripped()
+            df["text"] = (title.str.strip() + "\n\n" + body.str.strip()).str.strip()
             rows.append(df)
 
     if not rows:
@@ -114,6 +115,7 @@ def load_all_submissions(clean_root: Path) -> pd.DataFrame:
 
     print(f"[v4] Loaded {len(out):,} submissions total")
     return out
+
 
 
 def load_all_comments_for_submissions(
@@ -258,6 +260,7 @@ def main():
 
     def write_line(line: str):
         nonlocal part_idx, current_in_file, total_written, f
+        # Open new file if needed
         if f is None or current_in_file >= args.max_requests_per_file:
             if f is not None:
                 f.close()
