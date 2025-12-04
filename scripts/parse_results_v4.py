@@ -10,6 +10,15 @@ Works over a date RANGE instead of a single day dir.
 For v4, Batch results are written under Results_v4/submissions and
 contain BOTH submission and comment outputs. For kind=rc we re-use
 the same batch files, but only keep rows with a comment_id.
+
+Outputs:
+1) Range-wide annotated file (for backwards compatibility):
+   out_dir/submissions_annotated_<start>_to_<end>.parquet
+   out_dir/comments_annotated_<start>_to_<end>.parquet
+
+2) Day-partitioned outputs:
+   out_dir/submission_tickers/day=YYYY-MM-DD/annotated.parquet
+   out_dir/comment_tickers/day=YYYY-MM-DD/annotated.parquet
 """
 
 import argparse
@@ -268,6 +277,12 @@ def main():
         for it in parse_payload_text(txt):
             objects_seen += 1
 
+            # NEW GUARD: skip any non-dict junk rows
+            if not isinstance(it, dict):
+                # Optionally log once if you want:
+                # print("[v4] Skipping non-dict result item:", repr(it)[:200])
+                continue
+
             # --- Decide which ID we key on ---
             if kind == "rs":
                 # For submissions: only keep actual submission rows
@@ -321,13 +336,13 @@ def main():
                 "value_score": value_score,
             }
 
+
     print(f"[v4] Parsed {lines_seen} batch lines, {objects_seen} result objects.")
     print(f"[v4] Unique IDs with annotations: {len(parsed_by_id)}")
 
     id_keys = set(parsed_by_id.keys())
 
-    # For comments, we really only care about rows we actually annotated in this run.
-    # This also avoids hauling 4.4M comments through the merge during a small smoke test.
+    # For comments, only keep rows we actually annotated in this run.
     if kind == "rc":
         before = len(df_clean)
         df_clean = df_clean[df_clean["id"].isin(id_keys)].copy()
@@ -353,20 +368,29 @@ def main():
         annotated = df_clean.merge(meta, on="id", how="left")
         annotated["kind"] = "submission" if kind == "rs" else "comment"
 
-        out_name = (
-            f"{'submissions' if kind == 'rs' else 'comments'}"
-            f"_annotated_{start.isoformat()}_to_{end.isoformat()}.parquet"
-        )
+        base_name = "submissions" if kind == "rs" else "comments"
+
+        # 1) Range-wide output (for backwards compatibility)
+        out_name = f"{base_name}_annotated_{start.isoformat()}_to_{end.isoformat()}.parquet"
         out_parquet = out_dir / out_name
         annotated.to_parquet(out_parquet, index=False)
 
-        missing = annotated.loc[
-            ~annotated["id"].isin(id_keys), "id"
-        ].astype(str)
+        # 2) Day-partitioned outputs
+        if "__day__" in annotated.columns:
+            kind_dir = "submission_tickers" if kind == "rs" else "comment_tickers"
+            root = out_dir / kind_dir
+            for day, df_day in annotated.groupby("__day__"):
+                day_str = day.isoformat()
+                day_dir = root / f"day={day_str}"
+                day_dir.mkdir(parents=True, exist_ok=True)
+                day_out = day_dir / "annotated.parquet"
+                df_day.to_parquet(day_out, index=False)
+                print(f"[v4] Wrote {len(df_day)} {kind} rows → {day_out}")
+
+        # Missing IDs (mainly for submissions)
+        missing = annotated.loc[~annotated["id"].isin(id_keys), "id"].astype(str)
         if not missing.empty:
-            failed_path = out_dir / (
-                f"{'submissions' if kind == 'rs' else 'comments'}_failed.jsonl"
-            )
+            failed_path = out_dir / f"{base_name}_failed.jsonl"
             with failed_path.open("w", encoding="utf-8") as ff:
                 for did in missing:
                     ff.write(json.dumps({"id": did}) + "\n")
@@ -382,7 +406,6 @@ def main():
             f"[v4] Annotated {n_docs} {kind} docs; with >=1 ticker: {n_with} → {out_parquet}"
         )
     except Exception as e:
-        # If anything goes wrong in the heavy part, surface it clearly
         print(f"[v4] ERROR while building / writing annotated {kind} data: {repr(e)}")
         raise SystemExit(1)
 

@@ -1,4 +1,4 @@
-# scripts/prepare_requests_v4.py (v4 submission+comments context)
+# scripts/prepare_requests_v4.py (v4 submission+comments context, with file splitting)
 
 import argparse
 import json
@@ -8,7 +8,7 @@ import pandas as pd
 import datetime as dt
 
 SYSTEM_PROMPT = """
-You read INPUT ITEMS and must reply with ONLY:
+You read INPUT ITEMS and must reply with only:
 {"results":[ ... ]}
 One result per INPUT ITEM, same order.
 
@@ -18,16 +18,16 @@ Each INPUT ITEM is JSON:
 
 INPUT ITEMS always start with the submission; the rest are its comments.
 
-For each submission output:
+For each submission:
 {"submission_id":"<SID>","is_forward":true|false|null,"value_score":0.0-1.0,"tickers":[...]}
 
-For each comment output:
+For each comment:
 {"comment_id":"<CID>","submission_id":"<SID>","is_forward":true|false|null,"value_score":0.0-1.0,"tickers":[...]}
 
 Tickers:
 - Only real traded stocks/ETFs/REITs; symbols 1–6 A–Z, optional suffix like ".TO" or ".L".
 - Max 5 per item; NEVER treat generic words (gold, oil, market, crypto, etc.) as symbols.
-- You may infer symbols from clear context (e.g. “the VOO ETF”), but never invent them.
+- You may infer symbols from clear context, but never invent them.
 - Each ticker:
   {"symbol":"AAPL","sentiment_label":"positive|neutral|negative","sentiment_score":-1.0..1.0,"conf":0.0-1.0}
 
@@ -57,7 +57,6 @@ Use "text" for submissions and "comment_text" for comments.
 If no tickers: "tickers":[] but still set is_forward and value_score.
 No extra fields. No explanations.
 """.strip()
-
 
 
 def ensure_dir(p: Path) -> None:
@@ -181,6 +180,8 @@ def main():
     ap.add_argument("--max_output_tokens", type=int, default=800)
     ap.add_argument("--text_format", choices=["none","json_object","text","json_schema"],
                     default="json_object")
+    ap.add_argument("--max_requests_per_file", type=int, default=800,
+                    help="Maximum number of requests per .jsonl file (part-XXXXX.jsonl)")
     args = ap.parse_args()
 
     clean_root = Path(args.clean_root)
@@ -212,10 +213,9 @@ def main():
         # Read with utf-8-sig to transparently strip BOM if present
         raw_lines = seed_path.read_text(encoding="utf-8-sig").splitlines()
 
-        seeds: list[str] = []
+        seeds: List[str] = []
         for ln in raw_lines:
             s = ln.strip()
-            # extra safety: strip a leading BOM if it survived for any reason
             if s.startswith("\ufeff"):
                 s = s.lstrip("\ufeff")
             if s:
@@ -237,80 +237,103 @@ def main():
     sub_ids = df_subs["id"].tolist()
     df_comments = load_all_comments_for_submissions(clean_root, sub_ids)
 
-    # 5) Build and write requests grouped per submission
-    part_path = req_dir / "part-00000.jsonl"
-    written = 0
+    # 5) Build and write requests grouped per submission, splitting across part-*.jsonl
+    part_idx = -1
+    current_in_file = 0
+    total_written = 0
+    f = None  # current file handle
 
-    with part_path.open("w", encoding="utf-8") as f:
-        for _, sub in df_subs.iterrows():
-            sid = sub["id"]
-            stext = str(sub["text"])[:args.max_chars].strip()
-            if not stext:
-                continue
+    def write_line(line: str):
+        nonlocal part_idx, current_in_file, total_written, f
+        # Open new file if needed
+        if f is None or current_in_file >= args.max_requests_per_file:
+            if f is not None:
+                f.close()
+            part_idx += 1
+            part_path = req_dir / f"part-{part_idx:05d}.jsonl"
+            print(f"[v4] Opening {part_path} for writing...")
+            f = part_path.open("w", encoding="utf-8")
+            current_in_file = 0
+        f.write(line + "\n")
+        current_in_file += 1
+        total_written += 1
 
-            cmt_for_sub = (
-                df_comments[df_comments["link_id"] == f"t3_{sid}"]
-                if not df_comments.empty else pd.DataFrame()
+    for _, sub in df_subs.iterrows():
+        sid = sub["id"]
+        stext = str(sub["text"])[:args.max_chars].strip()
+        if not stext:
+            continue
+
+        cmt_for_sub = (
+            df_comments[df_comments["link_id"] == f"t3_{sid}"]
+            if not df_comments.empty else pd.DataFrame()
+        )
+
+        if cmt_for_sub.empty:
+            # Still send one request with just the submission (so it gets annotated)
+            groups = [[]]
+        else:
+            comments = [
+                {
+                    "kind": "comment",
+                    "comment_id": r["id"],
+                    "submission_id": sid,
+                    "comment_text": str(r["comment_text"])[:args.max_chars].strip(),
+                    "created_utc": int(r.get("created_utc", 0)),
+                }
+                for _, r in cmt_for_sub.sort_values("created_utc").iterrows()
+            ]
+            groups = list(chunk(comments, args.max_comments_per_req))
+
+        for gi, comment_chunk in enumerate(groups):
+            items: List[Dict[str, Any]] = []
+            # First item: submission
+            items.append({
+                "kind": "submission",
+                "submission_id": sid,
+                "text": stext,
+            })
+            # Remaining items: comments
+            items.extend(comment_chunk)
+
+            user_content = (
+                'Return JSON only: {"results":[...]} with one output per INPUT ITEM, same order.\n'
+                "BEGIN_INPUTS:\n" +
+                "\n".join(json.dumps(obj, ensure_ascii=False) for obj in items)
             )
 
-            if cmt_for_sub.empty:
-                # Still send one request with just the submission (so it gets annotated)
-                groups = [[]]
-            else:
-                comments = [
-                    {
-                        "kind": "comment",
-                        "comment_id": r["id"],
-                        "submission_id": sid,
-                        "comment_text": str(r["comment_text"])[:args.max_chars].strip(),
-                        "created_utc": int(r.get("created_utc", 0)),
-                    }
-                    for _, r in cmt_for_sub.sort_values("created_utc").iterrows()
-                ]
-                groups = list(chunk(comments, args.max_comments_per_req))
+            body: Dict[str, Any] = {
+                "model": args.model,
+                "input": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0,
+                "max_output_tokens": args.max_output_tokens,
+            }
+            if args.text_format != "none":
+                body["text"] = {"format": {"type": args.text_format}}
 
-            for gi, comment_chunk in enumerate(groups):
-                items: List[Dict[str, Any]] = []
-                # First item: submission
-                items.append({
-                    "kind": "submission",
-                    "submission_id": sid,
-                    "text": stext,
-                })
-                # Remaining items: comments
-                items.extend(comment_chunk)
-
-                user_content = (
-                    'Return JSON only: {"results":[...]} with one output per INPUT ITEM, same order.\n'
-                    "BEGIN_INPUTS:\n" +
-                    "\n".join(json.dumps(obj, ensure_ascii=False) for obj in items)
-                )
-
-                body: Dict[str, Any] = {
-                    "model": args.model,
-                    "input": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_content},
-                    ],
-                    "temperature": 0,
-                    "max_output_tokens": args.max_output_tokens,
-                }
-                if args.text_format != "none":
-                    body["text"] = {"format": {"type": args.text_format}}
-
-                custom_id = f"sub:{sid}:{gi:04d}"
-                line = {
+            custom_id = f"sub:{sid}:{gi:04d}"
+            line = json.dumps(
+                {
                     "custom_id": custom_id,
                     "method": "POST",
                     "url": "/v1/responses",
                     "body": body,
-                }
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
-                written += 1
+                },
+                ensure_ascii=False,
+            )
+            write_line(line)
 
-    print(f"[v4] Wrote {written} requests into {part_path}")
-    if written == 0:
+    if f is not None:
+        f.close()
+
+    if total_written == 0:
         print("[v4] WARNING: no requests actually written – check filters / seeds.")
+    else:
+        num_files = part_idx + 1
+        print(f"[v4] Wrote {total_written} requests into {num_files} file(s) under {req_dir}")
 
 
 if __name__ == "__main__":
