@@ -25,13 +25,23 @@ For each comment:
 {"comment_id":"<CID>","submission_id":"<SID>","is_forward":true|false|null,"value_score":0.0-1.0,"tickers":[...]}
 
 Tickers:
-- Only real traded stocks/ETFs/REITs; symbols 1–6 A–Z, optional suffix like ".TO" or ".L".
-- Max 5 per item; NEVER treat generic words (gold, oil, market, crypto, etc.) as symbols.
-- You may infer symbols from clear context, but never invent them.
-- Each ticker:
-  {"symbol":"AAPL","sentiment_label":"positive|neutral|negative","sentiment_score":-1.0..1.0,"conf":0.0-1.0}
+- Include only real traded instruments: equities, ETFs, REITs, major indices, commodities, FX pairs, crypto assets, and bonds.
+- Instruments may be identified either by a conventional ticker (e.g. "AAPL", "VOO", "BTC-USD") or by a clearly referenced asset name (e.g. gold, Bitcoin, US 10y, S&P 500 index).
+- Output symbols should be compatible with typical market data sources (e.g. yfinance): include suffixes where needed for non-US listings (e.g. ".L", ".TO") and prefer commonly traded retail-accessible tickers (e.g. GLD for gold unless a specific futures or currency form like "GC=F" or "XAUUSD" is explicitly stated; BTC-USD for bitcoin).
+- When multiple valid tickers exist, prefer the form most commonly used by typical retail investors unless the text clearly specifies a different instrument.
+- Avoid vague finance terms ("market", "stocks", "the economy") as instruments.
+- Max 5 instruments per item.
+- You may infer instruments from clear context in the submission and comments (e.g. the entire thread clearly discussing Nvidia) even if the name/ticker is not repeated, but do so only when confident.
+- Each instrument:
+  {
+    "symbol":"AAPL",
+    "asset_type":"equity|etf|reit|index|commodity|fx|crypto|bond|other",
+    "sentiment_label":"positive|neutral|negative",
+    "sentiment_score":-1.0..1.0,
+    "conf":0.0-1.0
+  }
 
-sentiment_score (for this ticker in this text):
+sentiment_score (for this instrument in this text):
 - -1.0 to -0.8 : very strong negative
 - -0.7 to -0.4 : clearly negative
 - -0.3 to -0.1 : mildly negative
@@ -54,7 +64,7 @@ value_score (trading info value of this text alone):
 - 0.9–1.0  : highly actionable, specific, falsifiable thesis
 
 Use "text" for submissions and "comment_text" for comments.
-If no tickers: "tickers":[] but still set is_forward and value_score.
+If no instruments: "tickers":[] but still set is_forward and value_score.
 No extra fields. No explanations.
 """.strip()
 
@@ -87,7 +97,7 @@ def load_all_submissions(clean_root: Path) -> pd.DataFrame:
 
             title = df.get("title", "").astype(str)
             body  = df.get("selftext", "").astype(str)
-            df["text"] = (title.str.strip() + "\n\n" + body.str.strip()).str.strip()
+            df["text"] = (title.str.strip() + "\n\n" + body.stripped()).str.strip()
             rows.append(df)
 
     if not rows:
@@ -146,13 +156,14 @@ def load_all_comments_for_submissions(
 
             df = df[mask].copy()
             df["comment_text"] = df.get("body", "").astype(str)
+            df["__day__"] = dt.date.fromisoformat(day_dir.name.split("=", 1)[1])
             rows.append(df)
 
     if not rows:
         print("[v4] WARNING: no comments found for selected submissions.")
         return pd.DataFrame(columns=[
             "id","link_id","comment_text","created_utc",
-            "subreddit","score","parent_id","permalink","author"
+            "subreddit","score","parent_id","permalink","author","__day__"
         ])
 
     out = pd.concat(rows, ignore_index=True)
@@ -210,7 +221,6 @@ def main():
     if args.seed_ids_file:
         seed_path = Path(args.seed_ids_file)
 
-        # Read with utf-8-sig to transparently strip BOM if present
         raw_lines = seed_path.read_text(encoding="utf-8-sig").splitlines()
 
         seeds: List[str] = []
@@ -221,7 +231,6 @@ def main():
             if s:
                 seeds.append(s)
 
-        # dedupe while preserving order
         seeds = list(dict.fromkeys(seeds))
 
         print(f"[v4] Seed IDs ({len(seeds)}): {seeds}")
@@ -233,11 +242,15 @@ def main():
             print("[v4] Nothing matches the provided seed IDs – aborting.")
             return
 
-    # 4) Load all comments for these submissions (across *all* days)
+    # 4) Sort submissions chronologically (stable across large runs)
+    if "created_dt" in df_subs.columns:
+        df_subs = df_subs.sort_values("created_dt").reset_index(drop=True)
+
+    # 5) Load all comments for these submissions (across *all* days)
     sub_ids = df_subs["id"].tolist()
     df_comments = load_all_comments_for_submissions(clean_root, sub_ids)
 
-    # 5) Build and write requests grouped per submission, splitting across part-*.jsonl
+    # 6) Build and write requests grouped per submission, splitting across part-*.jsonl
     part_idx = -1
     current_in_file = 0
     total_written = 0
@@ -245,7 +258,6 @@ def main():
 
     def write_line(line: str):
         nonlocal part_idx, current_in_file, total_written, f
-        # Open new file if needed
         if f is None or current_in_file >= args.max_requests_per_file:
             if f is not None:
                 f.close()
@@ -270,7 +282,6 @@ def main():
         )
 
         if cmt_for_sub.empty:
-            # Still send one request with just the submission (so it gets annotated)
             groups = [[]]
         else:
             comments = [
@@ -287,13 +298,11 @@ def main():
 
         for gi, comment_chunk in enumerate(groups):
             items: List[Dict[str, Any]] = []
-            # First item: submission
             items.append({
                 "kind": "submission",
                 "submission_id": sid,
                 "text": stext,
             })
-            # Remaining items: comments
             items.extend(comment_chunk)
 
             user_content = (
