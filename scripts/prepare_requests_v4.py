@@ -28,10 +28,9 @@ Tickers:
 - Include only real traded instruments: equities, ETFs, REITs, major indices, commodities, FX pairs, crypto assets, and bonds.
 - Instruments may be identified either by a conventional ticker (e.g. "AAPL", "VOO", "BTC-USD") or by a clearly referenced asset name (e.g. gold, Bitcoin, US 10y, S&P 500 index).
 - Output symbols should be compatible with typical market data sources (e.g. yfinance): include suffixes where needed for non-US listings (e.g. ".L", ".TO") and prefer commonly traded retail-accessible tickers (e.g. GLD for gold unless a specific futures or currency form like "GC=F" or "XAUUSD" is explicitly stated; BTC-USD for bitcoin).
+- For major indices prefer the yfinance symbol (e.g. "^GSPC" for S&P 500)
 - When multiple valid tickers exist, prefer the form most commonly used by typical retail investors unless the text clearly specifies a different instrument.
-- Avoid vague finance terms ("market", "stocks", "the economy") as instruments.
-- Max 5 instruments per item.
-- You may infer instruments from clear context in the submission and comments (e.g. the entire thread clearly discussing Nvidia) even if the name/ticker is not repeated, but do so only when confident.
+- You may infer mentions of instruments from clear context in the submission and comments even if the name/ticker is not explicitly written in that instance if the reference is unambiguous.
 - Each instrument:
   {
     "symbol":"AAPL",
@@ -41,27 +40,28 @@ Tickers:
     "conf":0.0-1.0
   }
 
-sentiment_score (for this instrument in this text):
-- -1.0 to -0.8 : very strong negative
-- -0.7 to -0.4 : clearly negative
-- -0.3 to -0.1 : mildly negative
+sentiment_score:
+- -1.0 to -0.8 : very negative 
+- -0.7 to -0.4 : negative
+- -0.3 to -0.1 : slightly negative
 -  0.0         : neutral / cannot infer
--  0.1 to 0.3  : mildly positive
--  0.4 to 0.7  : clearly positive
--  0.8 to 1.0  : very strong positive
+-  0.1 to 0.3  : slightly positive
+-  0.4 to 0.7  : positive
+-  0.8 to 1.0  : very positive
 sentiment_label must match the sign of sentiment_score.
 
-is_forward (future-looking trading relevance of this text):
-- true  = clear forward view or trading action (prediction, target, “will buy/sell”, “will pump/dump”, etc.)
-- false = past events, questions, commentary, or no clear forward view
-- null  = only when intent is genuinely impossible to infer
+is_forward (future-looking trading relevance):
+- true  = Text contains a clear forward-looking statement or trading intent about one or more financial instruments (predictions, price targets, stated plan to buy/sell, etc.)
+- false = Default. For past actions, generic opinions, jokes, vague hype, ambiguous optimism (“to the moon”), or questions that do not express a thesis.
+- null  = Intent cannot be determined.
+
 
 value_score (trading info value of this text alone):
-- 0.0      : no trading value / pure meme
-- 0.1–0.3  : very low value (vague, emotional, noisy)
-- 0.4–0.6  : relevant but shallow or vague
-- 0.7–0.8  : moderately useful reasoning
-- 0.9–1.0  : highly actionable, specific, falsifiable thesis
+- 0.0      : no trading value (meme, no trading information gain)
+- 0.1–0.2  : stance only (opinion without reasoning or justification)
+- 0.3–0.5  : basic thesis (some reasoning beyond generic optimism; limited depth or missing concrete specifics)
+- 0.6–0.8  : strong thesis (detailed reasoning, catalysts, AND specific targets/timeframe)
+- 0.9–1.0  : exceptional thesis (comprehensive analysis with risk factors, entry/exit logic, catalysts, and falsifiable targets/timeline)
 
 Use "text" for submissions and "comment_text" for comments.
 If no instruments: "tickers":[] but still set is_forward and value_score.
