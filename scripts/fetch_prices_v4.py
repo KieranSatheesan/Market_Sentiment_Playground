@@ -10,7 +10,7 @@ compute basic market labels, and write per-day parquet partitions.
 
 Behavior:
 - Discovers symbols from reddit_daily_v4 for the requested window.
-- Batch-downloads via yfinance; skips unfetchable tickers quickly.
+- Batch-downloads via yfinance; skips unfetchable tickers.
 - Uses Adjusted Close for returns if present, else Close.
 - Computes ret1, ret5, ret1_roll_std (ret_roll=5), vol_roll_mean (vol_roll=5).
 - Append-only; skips existing days unless --force.
@@ -43,7 +43,9 @@ def _existing_day_written(out_root: str, day: pd.Timestamp) -> bool:
     return os.path.isdir(dpath) and bool(glob.glob(os.path.join(dpath, "*.parquet")))
 
 
-def _discover_symbols(reddit_daily_root: str, start: str, end: str) -> Tuple[Set[str], List[pd.Timestamp]]:
+def _discover_symbols(
+    reddit_daily_root: str, start: str, end: str
+) -> Tuple[Set[str], List[pd.Timestamp]]:
     days = _list_days_between(start, end)
     symbols: Set[str] = set()
     found_days: List[pd.Timestamp] = []
@@ -54,7 +56,15 @@ def _discover_symbols(reddit_daily_root: str, start: str, end: str) -> Tuple[Set
             continue
         try:
             df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-            syms = df["symbol"].dropna().astype(str).str.upper().str.strip().unique().tolist()
+            syms = (
+                df["symbol"]
+                .dropna()
+                .astype(str)
+                .str.upper()
+                .str.strip()
+                .unique()
+                .tolist()
+            )
             symbols.update(syms)
             found_days.append(d)
         except Exception as e:
@@ -63,22 +73,32 @@ def _discover_symbols(reddit_daily_root: str, start: str, end: str) -> Tuple[Set
     return symbols, found_days
 
 
-def _download_batch(tickers: List[str], start_inclusive: str, end_exclusive: str, max_retries=3, sleep=2.0) -> pd.DataFrame:
+def _download_batch(
+    tickers: List[str],
+    start_inclusive: str,
+    end_exclusive: str,
+    max_retries: int = 3,
+    sleep: float = 2.0,
+) -> pd.DataFrame:
     """
     Return tidy long OHLCV for successfully fetched tickers in the batch.
-    Skips unfetchables (no empty frames returned).
+    Skips unfetchables (no non-empty frames returned).
 
     Parameters:
       start_inclusive: YYYY-MM-DD
       end_exclusive:   YYYY-MM-DD (yfinance will not include this date)
     """
+    if not tickers:
+        return pd.DataFrame()
+
     last_err = None
     for i in range(max_retries):
         try:
+            # IMPORTANT: pass the list directly, not a joined string
             data = yf.download(
-                " ".join(tickers),
+                tickers=tickers,
                 start=start_inclusive,
-                end=end_exclusive,   # exclusive per yfinance
+                end=end_exclusive,  # exclusive per yfinance
                 group_by="ticker",
                 auto_adjust=False,
                 progress=False,
@@ -87,14 +107,24 @@ def _download_batch(tickers: List[str], start_inclusive: str, end_exclusive: str
             break
         except Exception as e:
             last_err = e
+            print(f"[WARN] Batch download error (attempt {i+1}/{max_retries}): {e}")
             time.sleep(sleep * (1.5 ** i))
     else:
-        print(f"[WARN] Batch download failed: {last_err}")
+        print(f"[WARN] Batch download failed after {max_retries} attempts: {last_err}")
+        return pd.DataFrame()
+
+    if data is None or (isinstance(data, pd.DataFrame) and data.dropna(how="all").empty):
         return pd.DataFrame()
 
     long_rows = []
-    if isinstance(data.columns, pd.MultiIndex):
+
+    # Multi-ticker case → MultiIndex columns, one top level per ticker
+    if isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
         present = list(data.columns.levels[0])
+        missing_in_batch = sorted(set(tickers) - set(present))
+        if missing_in_batch:
+            print(f"[INFO] In this batch, no data returned for: {missing_in_batch}")
+
         for t in tickers:
             if t not in present:
                 continue
@@ -109,13 +139,32 @@ def _download_batch(tickers: List[str], start_inclusive: str, end_exclusive: str
                 if c in tmp.columns
             ]
             long_rows.append(tmp[keep])
-    else:
-        # Single-ticker flat DF case: avoid mislabeling ticker name, skip
-        if isinstance(data, pd.DataFrame) and not data.dropna(how="all").empty:
-            pass
+
+    # Single-ticker case → flat columns
+    elif isinstance(data, pd.DataFrame):
+        if len(tickers) == 1:
+            t = tickers[0]
+            df_t = data
+            if not df_t.dropna(how="all").empty:
+                tmp = df_t.reset_index().rename(columns={"Date": "day"})
+                tmp["symbol"] = t
+                keep = ["day", "symbol"] + [
+                    c
+                    for c in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+                    if c in tmp.columns
+                ]
+                long_rows.append(tmp[keep])
+        else:
+            # Unexpected: multiple tickers requested but got flat columns.
+            # Log and skip rather than mis-assign.
+            print(
+                "[WARN] Unexpected flat DataFrame for multi-ticker batch; "
+                f"tickers={tickers}. Skipping this batch."
+            )
 
     if not long_rows:
         return pd.DataFrame()
+
     return pd.concat(long_rows, ignore_index=True)
 
 
@@ -135,7 +184,11 @@ def fetch_prices_v4(
         print("[INFO] No symbols discovered in reddit_daily_v4 for this window.")
         return
 
-    print(f"[INFO] Symbols discovered: {len(symbols)}; days with reddit activity: {len(days_with_reddit)}")
+    symbols = sorted({s.strip().upper() for s in symbols if s})
+    print(
+        f"[INFO] Symbols discovered in reddit_daily_v4: {len(symbols)}; "
+        f"days with reddit activity: {len(days_with_reddit)}"
+    )
 
     # yfinance end is exclusive → add +1 day to include requested final day
     start_dt = pd.to_datetime(start).normalize()
@@ -143,18 +196,17 @@ def fetch_prices_v4(
     dl_start = start_dt.strftime("%Y-%m-%d")
     dl_end = (end_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
-    symbols = sorted(list(symbols))
-
-    # Download all data for full range in batches, then compute labels and split per day.
+    # Download all data for full range in batches
     long_frames = []
     for i in range(0, len(symbols), batch):
-        chunk = symbols[i: i + batch]
+        chunk = symbols[i : i + batch]
+        print(f"[INFO] Downloading batch {i//batch + 1} with {len(chunk)} symbols...")
         df_long = _download_batch(chunk, dl_start, dl_end)
         if not df_long.empty:
             long_frames.append(df_long)
 
     if not long_frames:
-        print("[INFO] No price data fetched.")
+        print("[INFO] No price data fetched at all.")
         return
 
     prices = pd.concat(long_frames, ignore_index=True)
@@ -164,7 +216,9 @@ def fetch_prices_v4(
     # Clamp to the original inclusive window [start_dt, end_dt]
     prices = prices[(prices["day"] >= start_dt) & (prices["day"] <= end_dt)]
     if prices.empty:
-        print("[INFO] Price rows exist but none within the requested window after clamping.")
+        print(
+            "[INFO] Price rows exist but none within the requested window after clamping."
+        )
         return
 
     prices = prices.sort_values(["symbol", "day"]).reset_index(drop=True)
@@ -181,16 +235,35 @@ def fetch_prices_v4(
         .std()
         .reset_index(level=0, drop=True)
     )
-    prices["vol_roll_mean"] = (
-        prices.groupby("symbol")["Volume"]
-        .rolling(vol_roll, min_periods=3)
-        .mean()
-        .reset_index(level=0, drop=True)
-    )
+    if "Volume" in prices.columns:
+        prices["vol_roll_mean"] = (
+            prices.groupby("symbol")["Volume"]
+            .rolling(vol_roll, min_periods=3)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+    else:
+        prices["vol_roll_mean"] = np.nan
 
-    # Helpful summary
+    # Helpful summary + missing-symbols log
     fetched_syms = sorted(prices["symbol"].unique().tolist())
-    print(f"[INFO] Fetched rows for {len(fetched_syms)} / {len(symbols)} symbols within {start} → {end}")
+    print(
+        f"[INFO] Fetched rows for {len(fetched_syms)} / {len(symbols)} symbols "
+        f"within {start} → {end}"
+    )
+    missing_syms = sorted(set(symbols) - set(fetched_syms))
+    if missing_syms:
+        os.makedirs(out_root, exist_ok=True)
+        missing_path = os.path.join(
+            out_root, f"missing_symbols_{start}_to_{end}.txt"
+        )
+        with open(missing_path, "w", encoding="utf-8") as f:
+            for s in missing_syms:
+                f.write(s + "\n")
+        print(
+            f"[INFO] Symbols with no price data in this window: {len(missing_syms)} "
+            f"(written to {missing_path})"
+        )
 
     # Write per-day partitions
     os.makedirs(out_root, exist_ok=True)
@@ -212,15 +285,22 @@ def fetch_prices_v4(
         written += 1
         print(f"[WRITE] {out_path}  rows={len(part)}")
 
-    print(f"[DONE] prices_yahoo_v4: wrote {written} day partitions (skipped existing: {len(days) - written}).")
+    print(
+        f"[DONE] prices_yahoo_v4: wrote {written} day partitions "
+        f"(skipped existing: {len(days) - written})."
+    )
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="Fetch Yahoo OHLCV and compute basic labels per (symbol, day) for v4 reddit_daily."
     )
-    ap.add_argument("--reddit-daily-root", required=True, help="Path to featuresets/reddit_daily_v4")
-    ap.add_argument("--out-root", required=True, help="Output root for featuresets/prices_yahoo_v4")
+    ap.add_argument(
+        "--reddit-daily-root", required=True, help="Path to featuresets/reddit_daily_v4"
+    )
+    ap.add_argument(
+        "--out-root", required=True, help="Output root for featuresets/prices_yahoo_v4"
+    )
     ap.add_argument("--start", required=True)
     ap.add_argument("--end", required=True)
     ap.add_argument("--batch", type=int, default=150)
