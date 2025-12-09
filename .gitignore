@@ -58,3 +58,5 @@ data_v4/
 batch_v4_test/
 data_v4_test/
 batch_v4/
+output_refetch.txt
+output_refetch_throttled.txt
